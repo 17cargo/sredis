@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/hudangwei/sredis"
+	"github.com/17cargo/sredis"
 )
 
 func main() {

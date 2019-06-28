@@ -62,6 +62,7 @@ type Client struct {
 	futureQueue           *RingQueue
 	futureSchedulerStatus int32
 	futureCnt             int32
+	futureTimeout         time.Duration
 
 	mgr   *RoundRobinAsyncClient
 	index int
@@ -69,15 +70,40 @@ type Client struct {
 	mu    *sync.RWMutex
 }
 
-func NewClient(mgr *RoundRobinAsyncClient, index int, conn redigo.Conn) *Client {
-	return &Client{
-		mgr:          mgr,
-		index:        index,
-		batchSize:    200,
-		requestQueue: NewRingQueue(10000),
-		futureQueue:  NewRingQueue(10000),
-		conn:         conn,
-		mu:           &sync.RWMutex{},
+func NewClient(mgr *RoundRobinAsyncClient, index int, conn redigo.Conn, opts ...OptionFunc) *Client {
+	cli := &Client{
+		mgr:           mgr,
+		index:         index,
+		batchSize:     200,
+		requestQueue:  NewRingQueue(10000),
+		futureQueue:   NewRingQueue(10000),
+		conn:          conn,
+		mu:            &sync.RWMutex{},
+		futureTimeout: time.Second * 2,
+	}
+
+	for _, opt := range opts {
+		_ = opt(cli)
+	}
+
+	return cli
+}
+
+// OptionFunc setup configuration should be customizable
+type OptionFunc func(*Client) error
+
+// WithBatchSize makes easy for use to set batch size that is useful
+func WithBatchSize(batchSize int) OptionFunc {
+	return func(c *Client) error {
+		c.batchSize = batchSize
+		return nil
+	}
+}
+
+func WithFutureTimeout(timeout time.Duration) OptionFunc {
+	return func(c *Client) error {
+		c.futureTimeout = timeout
+		return nil
 	}
 }
 
@@ -101,9 +127,10 @@ func (cli *Client) AsyncDo(cmd string, args ...interface{}) (interface{}, error)
 	cli.requestQueue.Push(&Request{cmd, args, future})
 	cli.requestSchedule()
 
-	timer := time.NewTimer(2 * time.Second)
+	timer := time.NewTimer(cli.futureTimeout)
 	select {
 	case <-future.wait:
+		// FIXME: https://golang.org/pkg/time/#Timer.Stop
 		timer.Stop()
 		return future.r, future.err
 	case <-timer.C:
@@ -133,88 +160,96 @@ func (cli *Client) futureSchedule() {
 
 func (cli *Client) processRequest() {
 	atomic.StoreInt32(&cli.requestCnt, HasNoData)
-process:
-	cli.requestRun()
-	atomic.StoreInt32(&cli.requestSchedulerStatus, Idle)
-	if atomic.SwapInt32(&cli.requestCnt, HasNoData) == HasData {
-		if atomic.CompareAndSwapInt32(&cli.requestSchedulerStatus, Idle, Running) {
-			goto process
+	for {
+		cli.requestRun()
+		atomic.StoreInt32(&cli.requestSchedulerStatus, Idle)
+		if atomic.SwapInt32(&cli.requestCnt, HasNoData) != HasData {
+			return
+		}
+		if !atomic.CompareAndSwapInt32(&cli.requestSchedulerStatus, Idle, Running) {
+			return
 		}
 	}
 }
 
 func (cli *Client) processFuture() {
 	atomic.StoreInt32(&cli.futureCnt, HasNoData)
-process:
-	cli.futureRun()
-	atomic.StoreInt32(&cli.futureSchedulerStatus, Idle)
-	if atomic.SwapInt32(&cli.futureCnt, HasNoData) == HasData {
-		if atomic.CompareAndSwapInt32(&cli.futureSchedulerStatus, Idle, Running) {
-			goto process
+	for {
+		cli.futureRun()
+		atomic.StoreInt32(&cli.futureSchedulerStatus, Idle)
+		if atomic.SwapInt32(&cli.futureCnt, HasNoData) != HasData {
+			return
+		}
+		if !atomic.CompareAndSwapInt32(&cli.futureSchedulerStatus, Idle, Running) {
+			return
 		}
 	}
 }
 
 func (cli *Client) requestRun() {
 	var err error
-	if v, ok := cli.requestQueue.PopMany(int64(cli.batchSize)); ok {
-		var futures []*Request
+	v, ok := cli.requestQueue.PopMany(int64(cli.batchSize))
+	if !ok {
+		return
+	}
+	var futures []*Request
+	for _, vv := range v {
+		req := vv.(*Request)
+		if req.future.IsTimeout() {
+			continue
+		}
+		err = cli.getConn().Send(req.cmd, req.args...)
+		if err != nil {
+			fmt.Println("Send with err:", err)
+			cli.mgr.ResetClientConn(cli.index, cli)
+			break
+		}
+		futures = append(futures, req)
+	}
+	if err != nil {
 		for _, vv := range v {
 			req := vv.(*Request)
-			if req.future.IsTimeout() {
-				continue
-			}
-			err = cli.getConn().Send(req.cmd, req.args...)
-			if err != nil {
-				fmt.Println("Send with err:", err)
-				cli.mgr.ResetClientConn(cli.index, cli)
-				break
-			}
-			futures = append(futures, req)
+			req.future.err = err
+			close(req.future.wait)
 		}
-		if err != nil {
-			for _, vv := range v {
-				req := vv.(*Request)
-				req.future.err = err
-				close(req.future.wait)
-			}
-			return
-		}
-		if len(futures) == 0 {
-			return
-		}
-		err = cli.getConn().Flush()
-		if err != nil {
-			fmt.Println("Flush with err:", err)
-			cli.mgr.ResetClientConn(cli.index, cli)
-			for _, req := range futures {
-				req.future.err = err
-				close(req.future.wait)
-			}
-			return
-		}
-
-		cli.postFuture(&FutureChan{futures, cli.getConn()})
+		return
 	}
+	if len(futures) == 0 {
+		return
+	}
+	err = cli.getConn().Flush()
+	if err != nil {
+		fmt.Println("Flush with err:", err)
+		cli.mgr.ResetClientConn(cli.index, cli)
+		for _, req := range futures {
+			req.future.err = err
+			close(req.future.wait)
+		}
+		return
+	}
+
+	cli.postFuture(&FutureChan{futures, cli.getConn()})
 }
 
 func (cli *Client) futureRun() {
 	var err error
-	if v, ok := cli.futureQueue.PopMany(int64(cli.batchSize)); ok {
-		for _, vv := range v {
-			futureCh := vv.(*FutureChan)
-			for _, req := range futureCh.futures {
-				if err != nil {
-					req.future.err = err
-					close(req.future.wait)
-					continue
-				}
-				var resp interface{}
-				resp, err = futureCh.conn.Receive()
-				req.future.r = resp
+	v, ok := cli.futureQueue.PopMany(int64(cli.batchSize))
+	if !ok {
+		return
+	}
+	for _, vv := range v {
+		futureCh := vv.(*FutureChan)
+		for _, req := range futureCh.futures {
+			if err != nil {
 				req.future.err = err
 				close(req.future.wait)
+				continue
 			}
+			var resp interface{}
+			resp, err = futureCh.conn.Receive()
+			req.future.r = resp
+			req.future.err = err
+			close(req.future.wait)
 		}
 	}
 }
