@@ -36,7 +36,7 @@ func (r *SRedis) OpenWithConfig(config RedisConfig) error {
 	if config.Size <= 0 {
 		config.Size = 1
 	}
-	r.client = NewRoundRobinAsyncClient(dial, config.Size)
+	r.client = NewRoundRobinAsyncClient(dial, SetRoundRobinAsyncClientConnectionCount(config.Size))
 	return nil
 }
 

@@ -107,10 +107,12 @@ func WithFutureTimeout(timeout time.Duration) OptionFunc {
 	}
 }
 
-func (cli *Client) ResetConn(conn redigo.Conn) {
+func (cli *Client) ResetConn(conn redigo.Conn) redigo.Conn {
 	cli.mu.Lock()
 	defer cli.mu.Unlock()
+	old := cli.conn
 	cli.conn = conn
+	return old
 }
 
 func (cli *Client) getConn() redigo.Conn {
