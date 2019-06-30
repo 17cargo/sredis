@@ -68,6 +68,10 @@ func (q *RingQueue) Pop() (interface{}, bool) {
 		return nil, false
 	}
 	q.lock.Lock()
+	if q.Empty() {
+		q.lock.Unlock()
+		return nil, false
+	}
 	c := q.content
 	c.head = (c.head + 1) % c.mod
 	res := c.buffer[c.head]
@@ -82,6 +86,10 @@ func (q *RingQueue) PopMany(count int64) ([]interface{}, bool) {
 		return nil, false
 	}
 	q.lock.Lock()
+	if q.Empty() {
+		q.lock.Unlock()
+		return nil, false
+	}
 	c := q.content
 	if count >= q.len {
 		count = q.len
