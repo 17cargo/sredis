@@ -13,16 +13,39 @@ type RoundRobinAsyncClient struct {
 	connectCnt int
 	clients    []*Client
 	index      uint64
+
+	closeDelayTime      int64
+	closeDelayTaskQueue *SimpleDelayQueue
 }
 
-func NewRoundRobinAsyncClient(newFn func() (redigo.Conn, error), connectCnt int) *RoundRobinAsyncClient {
+type RoundRobinAsyncClientOption func(cli *RoundRobinAsyncClient)
+
+func NewRoundRobinAsyncClient(newFn func() (redigo.Conn, error), opts ...RoundRobinAsyncClientOption) *RoundRobinAsyncClient {
 	ret := &RoundRobinAsyncClient{
-		Dial:       newFn,
-		connectCnt: connectCnt,
-		clients:    make([]*Client, 0),
+		Dial:                newFn,
+		connectCnt:          10,
+		clients:             make([]*Client, 0),
+		closeDelayTime:      5,
+		closeDelayTaskQueue: NewSimpleDelayQueue(),
+	}
+	for i := range opts {
+		opts[i](ret)
 	}
 	ret.init()
+	go ret.closeLoop()
 	return ret
+}
+
+func SetRoundRobinAsyncClientConnectionCount(count int) RoundRobinAsyncClientOption {
+	return func(cli *RoundRobinAsyncClient) {
+		cli.connectCnt = count
+	}
+}
+
+func SetRoundRobinAsyncClientCloseDelayTime(t int64) RoundRobinAsyncClientOption {
+	return func(cli *RoundRobinAsyncClient) {
+		cli.closeDelayTime = t
+	}
 }
 
 func (cli *RoundRobinAsyncClient) init() {
@@ -50,7 +73,8 @@ func (cli *RoundRobinAsyncClient) ResetClientConn(index int, client *Client) {
 			time.Sleep(time.Second)
 			continue
 		}
-		cli.clients[index].ResetConn(c)
+		oldConn := cli.clients[index].ResetConn(c)
+		cli.closeDelayTaskQueue.Push(time.Now().Unix()+cli.closeDelayTime, oldConn)
 		break
 	}
 }
@@ -65,4 +89,16 @@ func (cli *RoundRobinAsyncClient) AsyncDo(cmd string, args ...interface{}) (inte
 		return nil, errors.New("no clients")
 	}
 	return cli.clients[index].AsyncDo(cmd, args...)
+}
+
+func (cli RoundRobinAsyncClient) closeLoop() {
+	for {
+		connections := cli.closeDelayTaskQueue.PopMany(time.Now().Unix())
+		for i := range connections {
+			if connections[i] != nil {
+				connections[i].Close()
+			}
+		}
+		time.Sleep(time.Second)
+	}
 }
